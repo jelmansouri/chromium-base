@@ -23,10 +23,13 @@
 #include <stdlib.h>
 #include <tchar.h> // Must be before tpcshrd.h or for any use of _T macro
 #include <tpcshrd.h>
-#include <uiviewsettingsinterop.h>
 #include <windows.ui.viewmanagement.h>
 #include <winstring.h>
 #include <wrl/wrappers/corewrappers.h>
+
+#if defined (USE_WINSDK_10_DEP)
+#include <uiviewsettingsinterop.h>
+#endif // defined (USE_WINSDK_10_DEP)
 
 #include <memory>
 
@@ -119,6 +122,7 @@ POWER_PLATFORM_ROLE GetPlatformRole() {
 // it to always return UserInteractionMode_Touch which as per documentation
 // indicates tablet mode.
 bool IsWindows10TabletMode(HWND hwnd) {
+#if defined (USE_WINSDK_10_DEP)
   if (GetVersion() < VERSION_WIN10)
     return false;
 
@@ -187,6 +191,9 @@ bool IsWindows10TabletMode(HWND hwnd) {
       ABI::Windows::UI::ViewManagement::UserInteractionMode_Mouse;
   view_settings->get_UserInteractionMode(&mode);
   return mode == ABI::Windows::UI::ViewManagement::UserInteractionMode_Touch;
+#else
+    return false;
+#endif // defined (USE_WINSDK_10_DEP)
 }
 
 // Returns true if a physical keyboard is detected on Windows 8 and up.
