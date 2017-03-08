@@ -17,6 +17,10 @@
 #include "base/threading/thread_restrictions.h"
 #include "build/build_config.h"
 
+#if defined(OS_POSIX) && !defined(OS_NACL)
+#include "base/files/file_descriptor_watcher_posix.h"
+#endif
+
 #if defined(OS_WIN)
 #include "base/win/scoped_com_initializer.h"
 #endif
@@ -209,6 +213,11 @@ void Thread::StopSoon() {
       FROM_HERE, base::Bind(&Thread::ThreadQuitHelper, Unretained(this)));
 }
 
+void Thread::DetachFromSequence() {
+  DCHECK(owning_sequence_checker_.CalledOnValidSequence());
+  owning_sequence_checker_.DetachFromSequence();
+}
+
 PlatformThreadId Thread::GetThreadId() const {
   // If the thread is created but not started yet, wait for |id_| being ready.
   base::ThreadRestrictions::ScopedAllowWait allow_wait;
@@ -257,12 +266,7 @@ bool Thread::GetThreadWasQuitProperly() {
 
 void Thread::SetMessageLoop(MessageLoop* message_loop) {
   DCHECK(owning_sequence_checker_.CalledOnValidSequence());
-
-  // TODO(gab): Figure out why some callers pass in a null |message_loop|...
-  // https://crbug.com/629139#c15
-  // DCHECK(message_loop);
-  if (!message_loop)
-    return;
+  DCHECK(message_loop);
 
   // Setting |message_loop_| should suffice for this thread to be considered
   // as "running", until Stop() is invoked.
@@ -278,7 +282,7 @@ void Thread::ThreadMain() {
   // any place in the following thread initialization code.
   DCHECK(!id_event_.IsSignaled());
   // Note: this read of |id_| while |id_event_| isn't signaled is exceptionally
-  // okay because ThreadMain has an happens-after relationship with the other
+  // okay because ThreadMain has a happens-after relationship with the other
   // write in StartWithOptions().
   DCHECK_EQ(kInvalidThreadId, id_);
   id_ = PlatformThread::CurrentId();
@@ -294,6 +298,16 @@ void Thread::ThreadMain() {
   std::unique_ptr<MessageLoop> message_loop(message_loop_);
   message_loop_->BindToCurrentThread();
   message_loop_->SetTimerSlack(message_loop_timer_slack_);
+
+#if defined(OS_POSIX) && !defined(OS_NACL)
+  // Allow threads running a MessageLoopForIO to use FileDescriptorWatcher API.
+  std::unique_ptr<FileDescriptorWatcher> file_descriptor_watcher;
+  if (MessageLoopForIO::IsCurrent()) {
+    DCHECK_EQ(message_loop_, MessageLoopForIO::current());
+    file_descriptor_watcher.reset(
+        new FileDescriptorWatcher(MessageLoopForIO::current()));
+  }
+#endif
 
 #if defined(OS_WIN)
   std::unique_ptr<win::ScopedCOMInitializer> com_initializer;

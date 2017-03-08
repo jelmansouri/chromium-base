@@ -38,6 +38,7 @@
 #include "base/test/sequenced_worker_pool_owner.h"
 #include "base/test/test_switches.h"
 #include "base/test/test_timeouts.h"
+#include "base/threading/sequenced_worker_pool.h"
 #include "base/threading/thread.h"
 #include "base/threading/thread_checker.h"
 #include "base/threading/thread_task_runner_handle.h"
@@ -47,6 +48,8 @@
 
 #if defined(OS_POSIX)
 #include <fcntl.h>
+
+#include "base/files/file_descriptor_watcher_posix.h"
 #endif
 
 #if defined(OS_MACOSX)
@@ -87,6 +90,10 @@ const int kOutputTimeoutSeconds = 15;
 // Avoids flooding the logs with amount of output that gums up
 // the infrastructure.
 const size_t kOutputSnippetLinesLimit = 5000;
+
+// Limit of output snippet size. Exceeding this limit
+// results in truncating the output and failing the test.
+const size_t kOutputSnippetBytesLimit = 300 * 1024;
 
 // Set of live launch test processes with corresponding lock (it is allowed
 // for callers to launch processes on different threads).
@@ -152,26 +159,15 @@ void KillSpawnedTestProcesses() {
 
 // I/O watcher for the reading end of the self-pipe above.
 // Terminates any launched child processes and exits the process.
-class SignalFDWatcher : public MessageLoopForIO::Watcher {
- public:
-  SignalFDWatcher() {
-  }
+void OnShutdownPipeReadable() {
+  fprintf(stdout, "\nCaught signal. Killing spawned test processes...\n");
+  fflush(stdout);
 
-  void OnFileCanReadWithoutBlocking(int fd) override {
-    fprintf(stdout, "\nCaught signal. Killing spawned test processes...\n");
-    fflush(stdout);
+  KillSpawnedTestProcesses();
 
-    KillSpawnedTestProcesses();
-
-    // The signal would normally kill the process, so exit now.
-    _exit(1);
-  }
-
-  void OnFileCanWriteWithoutBlocking(int fd) override { NOTREACHED(); }
-
- private:
-  DISALLOW_COPY_AND_ASSIGN(SignalFDWatcher);
-};
+  // The signal would normally kill the process, so exit now.
+  _exit(1);
+}
 #endif  // defined(OS_POSIX)
 
 // Parses the environment variable var as an Int32.  If it is unset, returns
@@ -313,7 +309,26 @@ int LaunchChildTestProcessWithOptions(
     // in the set.
     AutoLock lock(g_live_processes_lock.Get());
 
+#if defined(OS_WIN)
+    // Allow the handle used to capture stdio and stdout to be inherited by the
+    // child. Note that this is done under g_live_processes_lock to ensure that
+    // only the desired child receives the handle.
+    if (new_options.stdout_handle) {
+      ::SetHandleInformation(new_options.stdout_handle, HANDLE_FLAG_INHERIT,
+                             HANDLE_FLAG_INHERIT);
+    }
+#endif
+
     process = LaunchProcess(command_line, new_options);
+
+#if defined(OS_WIN)
+    // Revoke inheritance so that the handle isn't leaked into other children.
+    // Note that this is done under g_live_processes_lock to ensure that only
+    // the desired child receives the handle.
+    if (new_options.stdout_handle)
+      ::SetHandleInformation(new_options.stdout_handle, HANDLE_FLAG_INHERIT, 0);
+#endif
+
     if (!process.IsValid())
       return -1;
 
@@ -386,19 +401,9 @@ void DoLaunchChildTestProcess(
   win::ScopedHandle handle;
 
   if (redirect_stdio) {
-    // Make the file handle inheritable by the child.
-    SECURITY_ATTRIBUTES sa_attr;
-    sa_attr.nLength = sizeof(SECURITY_ATTRIBUTES);
-    sa_attr.lpSecurityDescriptor = NULL;
-    sa_attr.bInheritHandle = TRUE;
-
-    handle.Set(CreateFile(output_file.value().c_str(),
-                          GENERIC_WRITE,
-                          FILE_SHARE_READ | FILE_SHARE_DELETE,
-                          &sa_attr,
-                          OPEN_EXISTING,
-                          FILE_ATTRIBUTE_TEMPORARY,
-                          NULL));
+    handle.Set(CreateFile(output_file.value().c_str(), GENERIC_WRITE,
+                          FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                          OPEN_EXISTING, FILE_ATTRIBUTE_TEMPORARY, NULL));
     CHECK(handle.IsValid());
     options.inherit_handles = true;
     options.stdin_handle = INVALID_HANDLE_VALUE;
@@ -530,15 +535,8 @@ bool TestLauncher::Run() {
   CHECK_EQ(0, sigaction(SIGQUIT, &action, NULL));
   CHECK_EQ(0, sigaction(SIGTERM, &action, NULL));
 
-  MessageLoopForIO::FileDescriptorWatcher controller;
-  SignalFDWatcher watcher;
-
-  CHECK(MessageLoopForIO::current()->WatchFileDescriptor(
-            g_shutdown_pipe[0],
-            true,
-            MessageLoopForIO::WATCH_READ,
-            &controller,
-            &watcher));
+  auto controller = base::FileDescriptorWatcher::WatchReadable(
+      g_shutdown_pipe[0], base::Bind(&OnShutdownPipeReadable));
 #endif  // defined(OS_POSIX)
 
   // Start the watchdog timer.
@@ -552,7 +550,7 @@ bool TestLauncher::Run() {
   if (requested_cycles != 1)
     results_tracker_.PrintSummaryOfAllIterations();
 
-  MaybeSaveSummaryAsJSON();
+  MaybeSaveSummaryAsJSON(std::vector<std::string>());
 
   return run_result_;
 }
@@ -584,8 +582,20 @@ void TestLauncher::LaunchChildGTestProcess(
            launched_callback));
 }
 
-void TestLauncher::OnTestFinished(const TestResult& result) {
+void TestLauncher::OnTestFinished(const TestResult& original_result) {
   ++test_finished_count_;
+
+  TestResult result(original_result);
+
+  if (result.output_snippet.length() > kOutputSnippetBytesLimit) {
+    if (result.status == TestResult::TEST_SUCCESS)
+      result.status = TestResult::TEST_EXCESSIVE_OUTPUT;
+    result.output_snippet = StringPrintf(
+        "<truncated (%" PRIuS " bytes)>\n", result.output_snippet.length()) +
+        result.output_snippet.substr(
+            result.output_snippet.length() - kOutputSnippetLinesLimit) +
+        "\n";
+  }
 
   bool print_snippet = false;
   std::string print_test_stdio("auto");
@@ -672,9 +682,7 @@ void TestLauncher::OnTestFinished(const TestResult& result) {
     KillSpawnedTestProcesses();
 #endif  // defined(OS_POSIX)
 
-    results_tracker_.AddGlobalTag("BROKEN_TEST_EARLY_EXIT");
-    results_tracker_.AddGlobalTag(kUnreliableResultsTag);
-    MaybeSaveSummaryAsJSON();
+    MaybeSaveSummaryAsJSON({"BROKEN_TEST_EARLY_EXIT", kUnreliableResultsTag});
 
     exit(1);
   }
@@ -821,6 +829,11 @@ bool TestLauncher::Init() {
   fprintf(stdout, "Using %" PRIuS " parallel jobs.\n", parallel_jobs_);
   fflush(stdout);
   if (parallel_jobs_ > 1U) {
+    // Allow usage of SequencedWorkerPool to launch test processes.
+    // TODO(fdoray): Remove this once the SequencedWorkerPool to TaskScheduler
+    // redirection experiment concludes https://crbug.com/622400.
+    SequencedWorkerPool::EnableForProcess();
+
     worker_pool_owner_ = MakeUnique<SequencedWorkerPoolOwner>(
         parallel_jobs_, "test_launcher");
   } else {
@@ -828,12 +841,8 @@ bool TestLauncher::Init() {
     worker_thread_->Start();
   }
 
-  if (command_line->HasSwitch(switches::kTestLauncherFilterFile) &&
-      command_line->HasSwitch(kGTestFilterFlag)) {
-    LOG(ERROR) << "Only one of --test-launcher-filter-file and --gtest_filter "
-               << "at a time is allowed.";
-    return false;
-  }
+  std::vector<std::string> positive_file_filter;
+  std::vector<std::string> positive_gtest_filter;
 
   if (command_line->HasSwitch(switches::kTestLauncherFilterFile)) {
     base::FilePath filter_file_path = base::MakeAbsoluteFilePath(
@@ -844,6 +853,8 @@ bool TestLauncher::Init() {
       return false;
     }
 
+    // Parse the file contents (see //testing/buildbot/filters/README.md
+    // for file syntax and other info).
     std::vector<std::string> filter_lines = SplitString(
         filter, "\n", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
     for (const std::string& filter_line : filter_lines) {
@@ -853,26 +864,27 @@ bool TestLauncher::Init() {
       if (filter_line[0] == '-')
         negative_test_filter_.push_back(filter_line.substr(1));
       else
-        positive_test_filter_.push_back(filter_line);
+        positive_file_filter.push_back(filter_line);
     }
+  }
+  // Split --gtest_filter at '-', if there is one, to separate into
+  // positive filter and negative filter portions.
+  std::string filter = command_line->GetSwitchValueASCII(kGTestFilterFlag);
+  size_t dash_pos = filter.find('-');
+  if (dash_pos == std::string::npos) {
+    positive_gtest_filter =
+        SplitString(filter, ":", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
   } else {
-    // Split --gtest_filter at '-', if there is one, to separate into
-    // positive filter and negative filter portions.
-    std::string filter = command_line->GetSwitchValueASCII(kGTestFilterFlag);
-    size_t dash_pos = filter.find('-');
-    if (dash_pos == std::string::npos) {
-      positive_test_filter_ = SplitString(
-          filter, ":", base::TRIM_WHITESPACE, base::SPLIT_WANT_ALL);
-    } else {
-      // Everything up to the dash.
-      positive_test_filter_ = SplitString(
-          filter.substr(0, dash_pos), ":", base::TRIM_WHITESPACE,
-          base::SPLIT_WANT_ALL);
+    // Everything up to the dash.
+    positive_gtest_filter =
+        SplitString(filter.substr(0, dash_pos), ":", base::TRIM_WHITESPACE,
+                    base::SPLIT_WANT_ALL);
 
-      // Everything after the dash.
-      negative_test_filter_ = SplitString(
-          filter.substr(dash_pos + 1), ":", base::TRIM_WHITESPACE,
-          base::SPLIT_WANT_ALL);
+    // Everything after the dash.
+    for (std::string pattern :
+         SplitString(filter.substr(dash_pos + 1), ":", base::TRIM_WHITESPACE,
+                     base::SPLIT_WANT_ALL)) {
+      negative_test_filter_.push_back(pattern);
     }
   }
 
@@ -880,6 +892,8 @@ bool TestLauncher::Init() {
     LOG(ERROR) << "Failed to get list of tests.";
     return false;
   }
+
+  CombinePositiveTestFilters(positive_gtest_filter, positive_file_filter);
 
   if (!results_tracker_.Init(*command_line)) {
     LOG(ERROR) << "Failed to initialize test results tracker.";
@@ -951,11 +965,43 @@ bool TestLauncher::Init() {
   return true;
 }
 
+void TestLauncher::CombinePositiveTestFilters(
+    std::vector<std::string> filter_a,
+    std::vector<std::string> filter_b) {
+  has_at_least_one_positive_filter_ = !filter_a.empty() || !filter_b.empty();
+  if (!has_at_least_one_positive_filter_) {
+    return;
+  }
+  // If two positive filters are present, only run tests that match a pattern
+  // in both filters.
+  if (!filter_a.empty() && !filter_b.empty()) {
+    for (size_t i = 0; i < tests_.size(); i++) {
+      std::string test_name =
+          FormatFullTestName(tests_[i].test_case_name, tests_[i].test_name);
+      bool found_a = false;
+      bool found_b = false;
+      for (size_t k = 0; k < filter_a.size(); ++k) {
+        found_a = found_a || MatchPattern(test_name, filter_a[k]);
+      }
+      for (size_t k = 0; k < filter_b.size(); ++k) {
+        found_b = found_b || MatchPattern(test_name, filter_b[k]);
+      }
+      if (found_a && found_b) {
+        positive_test_filter_.push_back(test_name);
+      }
+    }
+  } else if (!filter_a.empty()) {
+    positive_test_filter_ = filter_a;
+  } else {
+    positive_test_filter_ = filter_b;
+  }
+}
+
 void TestLauncher::RunTests() {
   std::vector<std::string> test_names;
   for (size_t i = 0; i < tests_.size(); i++) {
-    std::string test_name = FormatFullTestName(
-        tests_[i].test_case_name, tests_[i].test_name);
+    std::string test_name =
+        FormatFullTestName(tests_[i].test_case_name, tests_[i].test_name);
 
     results_tracker_.AddTest(test_name, tests_[i].file, tests_[i].line);
 
@@ -968,19 +1014,23 @@ void TestLauncher::RunTests() {
         continue;
     }
 
-    if (!launcher_delegate_->ShouldRunTest(
-        tests_[i].test_case_name, tests_[i].test_name)) {
+    if (!launcher_delegate_->ShouldRunTest(tests_[i].test_case_name,
+                                           tests_[i].test_name)) {
       continue;
     }
 
     // Count tests in the binary, before we apply filter and sharding.
     test_found_count_++;
 
+    std::string test_name_no_disabled =
+        TestNameWithoutDisabledPrefix(test_name);
+
     // Skip the test that doesn't match the filter (if given).
-    if (!positive_test_filter_.empty()) {
+    if (has_at_least_one_positive_filter_) {
       bool found = false;
-      for (size_t k = 0; k < positive_test_filter_.size(); ++k) {
-        if (MatchPattern(test_name, positive_test_filter_[k])) {
+      for (auto filter : positive_test_filter_) {
+        if (MatchPattern(test_name, filter) ||
+            MatchPattern(test_name_no_disabled, filter)) {
           found = true;
           break;
         }
@@ -989,21 +1039,28 @@ void TestLauncher::RunTests() {
       if (!found)
         continue;
     }
-    bool excluded = false;
-    for (size_t k = 0; k < negative_test_filter_.size(); ++k) {
-      if (MatchPattern(test_name, negative_test_filter_[k])) {
-        excluded = true;
-        break;
+    if (!negative_test_filter_.empty()) {
+      bool excluded = false;
+      for (auto filter : negative_test_filter_) {
+        if (MatchPattern(test_name, filter) ||
+            MatchPattern(test_name_no_disabled, filter)) {
+          excluded = true;
+          break;
+        }
       }
+
+      if (excluded)
+        continue;
     }
-    if (excluded)
-      continue;
 
     if (Hash(test_name) % total_shards_ != static_cast<uint32_t>(shard_index_))
       continue;
 
     test_names.push_back(test_name);
   }
+
+  // Save an early test summary in case the launcher crashes or gets killed.
+  MaybeSaveSummaryAsJSON({"EARLY_SUMMARY", kUnreliableResultsTag});
 
   test_started_count_ = launcher_delegate_->RunTests(this, test_names);
 
@@ -1042,12 +1099,13 @@ void TestLauncher::RunTestIteration() {
       FROM_HERE, Bind(&TestLauncher::RunTests, Unretained(this)));
 }
 
-void TestLauncher::MaybeSaveSummaryAsJSON() {
+void TestLauncher::MaybeSaveSummaryAsJSON(
+    const std::vector<std::string>& additional_tags) {
   const CommandLine* command_line = CommandLine::ForCurrentProcess();
   if (command_line->HasSwitch(switches::kTestLauncherSummaryOutput)) {
     FilePath summary_path(command_line->GetSwitchValuePath(
                               switches::kTestLauncherSummaryOutput));
-    if (!results_tracker_.SaveSummaryAsJSON(summary_path)) {
+    if (!results_tracker_.SaveSummaryAsJSON(summary_path, additional_tags)) {
       LOG(ERROR) << "Failed to save test launcher output summary.";
     }
   }

@@ -19,7 +19,6 @@
 #include "base/synchronization/lock.h"
 #include "base/task_scheduler/scheduler_worker_pool_params.h"
 #include "base/task_scheduler/task_scheduler.h"
-#include "base/task_scheduler/task_scheduler_impl.h"
 #include "base/test/sequenced_task_runner_test_template.h"
 #include "base/test/sequenced_worker_pool_owner.h"
 #include "base/test/task_runner_test_template.h"
@@ -244,17 +243,21 @@ class SequencedWorkerPoolTest
         tracker_(new TestTracker) {}
 
   void SetUp() override {
-    if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER) {
+    if (RedirectedToTaskScheduler()) {
       std::vector<SchedulerWorkerPoolParams> worker_pool_params;
       worker_pool_params.emplace_back(
           "SchedulerWorkerPoolName", ThreadPriority::NORMAL,
-          SchedulerWorkerPoolParams::IORestriction::ALLOWED, kNumWorkerThreads,
-          TimeDelta::Max());
+          SchedulerWorkerPoolParams::StandbyThreadPolicy::LAZY,
+          kNumWorkerThreads, TimeDelta::Max());
       TaskScheduler::CreateAndSetDefaultTaskScheduler(
           std::move(worker_pool_params),
           base::Bind([](const TaskTraits&) -> size_t { return 0U; }));
-      SequencedWorkerPool::ResetRedirectToTaskSchedulerForProcessForTesting();
-      SequencedWorkerPool::RedirectToTaskSchedulerForProcess();
+
+      // Unit tests run in an environment where SequencedWorkerPool is enabled
+      // without redirection to TaskScheduler. For the current unit test,
+      // disable it and re-enable it with redirection to TaskScheduler.
+      SequencedWorkerPool::DisableForProcessForTesting();
+      SequencedWorkerPool::EnableWithRedirectionToTaskSchedulerForProcess();
     }
   }
 
@@ -265,10 +268,19 @@ class SequencedWorkerPoolTest
     // TaskScheduler.
     DeletePool();
 
-    if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER) {
-      SequencedWorkerPool::ResetRedirectToTaskSchedulerForProcessForTesting();
+    if (RedirectedToTaskScheduler()) {
+      // Reset SequencedWorkerPool to its original state (i.e. enabled without
+      // redirection to TaskScheduler).
+      SequencedWorkerPool::DisableForProcessForTesting();
+      SequencedWorkerPool::EnableForProcess();
+
+      // Delete the registered TaskScheduler.
       DeleteTaskScheduler();
     }
+  }
+
+  bool RedirectedToTaskScheduler() const {
+    return GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER;
   }
 
   const scoped_refptr<SequencedWorkerPool>& pool() {
@@ -283,8 +295,7 @@ class SequencedWorkerPoolTest
   // Destroys and unregisters the registered TaskScheduler, if any.
   void DeleteTaskScheduler() {
     if (TaskScheduler::GetInstance()) {
-      static_cast<internal::TaskSchedulerImpl*>(TaskScheduler::GetInstance())
-          ->JoinForTesting();
+      TaskScheduler::GetInstance()->JoinForTesting();
       TaskScheduler::SetInstance(nullptr);
     }
   }
@@ -393,17 +404,22 @@ TEST_P(SequencedWorkerPoolTest, DelayedTaskDuringShutdown) {
 
   // Shutdown the pool.
   pool()->Shutdown();
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
+  if (RedirectedToTaskScheduler())
     TaskScheduler::GetInstance()->Shutdown();
 
   // Verify that we didn't block until the task was due.
   ASSERT_LT(base::Time::Now() - posted_at, TestTimeouts::action_timeout());
 
-  // Verify that the delayed task is deleted when the SequencedWorkerPool (and
-  // the TaskScheduler when applicable) are deleted.
-  EXPECT_FALSE(deleted_flag->data);
+  // TaskScheduler shouldn't delete the delayed task before it is itself
+  // deleted. SequencedWorkerPool starts deleting tasks as soon as its
+  // Shutdown() method is called (see SequencedWorkerPool::Inner::GetWork).
+  if (RedirectedToTaskScheduler())
+    EXPECT_FALSE(deleted_flag->data);
+
+  // Verify that the delayed task is deleted once the SequencedWorkerPool (and
+  // the TaskScheduler when applicable) have been deleted.
   DeletePool();
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
+  if (RedirectedToTaskScheduler())
     DeleteTaskScheduler();
   EXPECT_TRUE(deleted_flag->data);
 }
@@ -587,13 +603,6 @@ TEST_P(SequencedWorkerPoolTest, DISABLED_IgnoresAfterShutdown) {
 }
 
 TEST_P(SequencedWorkerPoolTest, AllowsAfterShutdown) {
-  // As tested by TaskSchedulerTaskTrackerTest.WillPostAndRunDuringShutdown,
-  // TaskScheduler allows tasks to be posted during shutdown. However, since it
-  // doesn't provide a way to run a callback from inside its Shutdown() method,
-  // it would be hard to make this test work with redirection enabled.
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
-    return;
-
   // Test that <n> new blocking tasks are allowed provided they're posted
   // by a running tasks.
   EnsureAllWorkersCreated();
@@ -609,7 +618,7 @@ TEST_P(SequencedWorkerPoolTest, AllowsAfterShutdown) {
   tracker()->WaitUntilTasksBlocked(kNumWorkerThreads);
 
   // Queue up shutdown blocking tasks behind those which will attempt to post
-  // additional tasks when run, PostAdditionalTasks attemtps to post 3
+  // additional tasks when run, PostAdditionalTasks attempts to post 3
   // new FastTasks, one for each shutdown_behavior.
   const int kNumQueuedTasks = static_cast<int>(kNumWorkerThreads);
   for (int i = 0; i < kNumQueuedTasks; ++i) {
@@ -619,15 +628,33 @@ TEST_P(SequencedWorkerPoolTest, AllowsAfterShutdown) {
         SequencedWorkerPool::BLOCK_SHUTDOWN));
   }
 
-  // Setup to open the floodgates from within Shutdown().
-  SetWillWaitForShutdownCallback(
-      base::Bind(&EnsureTasksToCompleteCountAndUnblock,
-                 scoped_refptr<TestTracker>(tracker()),
-                 0, &blocker, kNumBlockTasks));
+  // Half the additional blocking tasks will be allowed to run.
+  constexpr int kNumNewBlockingTasksToAllow = kNumWorkerThreads / 2;
 
-  // Allow half of the additional blocking tasks thru.
-  const int kNumNewBlockingTasksToAllow = kNumWorkerThreads / 2;
-  pool()->Shutdown(kNumNewBlockingTasksToAllow);
+  if (RedirectedToTaskScheduler()) {
+    // When redirection to TaskScheduler is enabled,
+    // SequencedWorkerPool::Shutdown() sets the number of additional
+    // BLOCK_SHUTDOWN tasks that can be posted and returns without waiting for
+    // pending BLOCK_SHUTDOWN tasks to complete their execution.
+    pool()->Shutdown(kNumNewBlockingTasksToAllow);
+
+    // Unblock tasks.
+    EnsureTasksToCompleteCountAndUnblock(tracker(), 0, &blocker,
+                                         kNumBlockTasks);
+
+    // TaskScheduler::Shutdown() waits for pending BLOCK_SHUTDOWN tasks to
+    // complete their execution.
+    TaskScheduler::GetInstance()->Shutdown();
+  } else {
+    // Once shutdown starts, unblock tasks.
+    SetWillWaitForShutdownCallback(base::Bind(
+        &EnsureTasksToCompleteCountAndUnblock,
+        scoped_refptr<TestTracker>(tracker()), 0, &blocker, kNumBlockTasks));
+
+    // Set the number of additional BLOCK_SHUTDOWN tasks that can be posted and
+    // wait for pending BLOCK_SHUTDOWN tasks to complete their execution.
+    pool()->Shutdown(kNumNewBlockingTasksToAllow);
+  }
 
   // Ensure that the correct number of tasks actually got run.
   tracker()->WaitUntilTasksComplete(static_cast<size_t>(
@@ -641,13 +668,6 @@ TEST_P(SequencedWorkerPoolTest, AllowsAfterShutdown) {
 // the task is not being posted within the context of a running task.
 TEST_P(SequencedWorkerPoolTest,
        AllowsBlockingTasksDuringShutdownOutsideOfRunningTask) {
-  // As tested by TaskSchedulerTaskTrackerTest.WillPostAndRunDuringShutdown,
-  // TaskScheduler allows tasks to be posted during shutdown. However, since it
-  // doesn't provide a way to run a callback from inside its Shutdown() method,
-  // it would be hard to make this test work with redirection enabled.
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
-    return;
-
   EnsureAllWorkersCreated();
   ThreadBlocker blocker;
 
@@ -660,15 +680,37 @@ TEST_P(SequencedWorkerPoolTest,
   }
   tracker()->WaitUntilTasksBlocked(kNumWorkerThreads);
 
-  // Setup to open the floodgates from within Shutdown().
-  SetWillWaitForShutdownCallback(
-      base::Bind(&TestTracker::PostBlockingTaskThenUnblockThreads,
-                 scoped_refptr<TestTracker>(tracker()), pool(), &blocker,
-                 kNumWorkerThreads));
-  pool()->Shutdown(kNumWorkerThreads + 1);
+  constexpr int kNumNewBlockingTasksToAllow = 1;
+
+  if (RedirectedToTaskScheduler()) {
+    // When redirection to TaskScheduler is enabled,
+    // SequencedWorkerPool::Shutdown() sets the number of additional
+    // BLOCK_SHUTDOWN tasks that can be posted and returns without waiting for
+    // pending BLOCK_SHUTDOWN tasks to complete their execution.
+    pool()->Shutdown(kNumNewBlockingTasksToAllow);
+
+    // Post a blocking task and unblock tasks.
+    tracker()->PostBlockingTaskThenUnblockThreads(pool(), &blocker,
+                                                  kNumWorkerThreads);
+
+    // TaskScheduler::Shutdown() waits for pending BLOCK_SHUTDOWN tasks to
+    // complete their execution.
+    TaskScheduler::GetInstance()->Shutdown();
+  } else {
+    // Once shutdown starts, post a blocking task and unblock tasks.
+    SetWillWaitForShutdownCallback(
+        base::Bind(&TestTracker::PostBlockingTaskThenUnblockThreads,
+                   scoped_refptr<TestTracker>(tracker()), pool(), &blocker,
+                   kNumWorkerThreads));
+
+    // Set the number of additional BLOCK_SHUTDOWN tasks that can be posted and
+    // wait for pending BLOCK_SHUTDOWN tasks to complete their execution.
+    pool()->Shutdown(kNumNewBlockingTasksToAllow);
+  }
 
   // Ensure that the correct number of tasks actually got run.
-  tracker()->WaitUntilTasksComplete(static_cast<size_t>(kNumWorkerThreads + 1));
+  tracker()->WaitUntilTasksComplete(
+      static_cast<size_t>(kNumWorkerThreads + kNumNewBlockingTasksToAllow));
   tracker()->ClearCompleteSequence();
 }
 
@@ -681,7 +723,7 @@ TEST_P(SequencedWorkerPoolTest, DiscardOnShutdown) {
   // CONTINUE_ON_SHUTDOWN tasks and runs BLOCK_SHUTDOWN tasks. However, since it
   // doesn't provide a way to run a callback from inside its Shutdown() method,
   // it would be hard to make this test work with redirection enabled.
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
+  if (RedirectedToTaskScheduler())
     return;
 
   // Start tasks to take all the threads and block them.
@@ -754,7 +796,7 @@ TEST_P(SequencedWorkerPoolTest, ContinueOnShutdown) {
 
   // This should not block. If this test hangs, it means it failed.
   pool()->Shutdown();
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
+  if (RedirectedToTaskScheduler())
     TaskScheduler::GetInstance()->Shutdown();
 
   // The task should not have completed yet.
@@ -784,7 +826,7 @@ TEST_P(SequencedWorkerPoolTest, SkipOnShutdown) {
   // TaskScheduler correctly handles SKIP_ON_SHUTDOWN tasks. However, since it
   // doesn't provide a way to run a callback from inside its Shutdown() method,
   // it would be hard to make this test work with redirection enabled.
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
+  if (RedirectedToTaskScheduler())
     return;
 
   // Start tasks to take all the threads and block them.
@@ -839,7 +881,7 @@ TEST_P(SequencedWorkerPoolTest, SkipOnShutdown) {
 // triggered. This is a regression test for http://crbug.com/117469.
 TEST_P(SequencedWorkerPoolTest, SpuriousWorkSignal) {
   // This test doesn't apply when tasks are redirected to the TaskScheduler.
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
+  if (RedirectedToTaskScheduler())
     return;
 
   EnsureAllWorkersCreated();
@@ -851,7 +893,7 @@ TEST_P(SequencedWorkerPoolTest, SpuriousWorkSignal) {
 }
 
 void VerifyRunsTasksOnCurrentThread(
-    SequencedWorkerPoolRedirection redirection,
+    bool redirected_to_task_scheduler,
     scoped_refptr<TaskRunner> test_positive_task_runner,
     scoped_refptr<TaskRunner> test_negative_task_runner,
     SequencedWorkerPool* pool,
@@ -862,7 +904,7 @@ void VerifyRunsTasksOnCurrentThread(
 
   // Tasks posted to different SequencedWorkerPools may run on the same
   // TaskScheduler threads.
-  if (redirection == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
+  if (redirected_to_task_scheduler)
     EXPECT_TRUE(unused_pool->RunsTasksOnCurrentThread());
   else
     EXPECT_FALSE(unused_pool->RunsTasksOnCurrentThread());
@@ -893,20 +935,22 @@ TEST_P(SequencedWorkerPoolTest, RunsTasksOnCurrentThread) {
   // - pool()->RunsTasksOnCurrentThread() returns true.
   // - unused_pool_owner.pool()->RunsTasksOnCurrentThread() returns false.
   sequenced_task_runner_1->PostTask(
-      FROM_HERE, base::Bind(&VerifyRunsTasksOnCurrentThread, GetParam(),
-                            sequenced_task_runner_1, sequenced_task_runner_2,
-                            base::RetainedRef(pool()),
-                            base::RetainedRef(unused_pool_owner.pool())));
+      FROM_HERE,
+      base::Bind(&VerifyRunsTasksOnCurrentThread, RedirectedToTaskScheduler(),
+                 sequenced_task_runner_1, sequenced_task_runner_2,
+                 base::RetainedRef(pool()),
+                 base::RetainedRef(unused_pool_owner.pool())));
   // From a task posted to |unsequenced_task_runner|:
   // - unsequenced_task_runner->RunsTasksOnCurrentThread() returns true.
   // - sequenced_task_runner_1->RunsTasksOnCurrentThread() returns false.
   // - pool()->RunsTasksOnCurrentThread() returns true.
   // - unused_pool_owner.pool()->RunsTasksOnCurrentThread() returns false.
   unsequenced_task_runner->PostTask(
-      FROM_HERE, base::Bind(&VerifyRunsTasksOnCurrentThread, GetParam(),
-                            unsequenced_task_runner, sequenced_task_runner_1,
-                            base::RetainedRef(pool()),
-                            base::RetainedRef(unused_pool_owner.pool())));
+      FROM_HERE,
+      base::Bind(&VerifyRunsTasksOnCurrentThread, RedirectedToTaskScheduler(),
+                 unsequenced_task_runner, sequenced_task_runner_1,
+                 base::RetainedRef(pool()),
+                 base::RetainedRef(unused_pool_owner.pool())));
 }
 
 // Checks that tasks are destroyed in the right context during shutdown. If a
@@ -935,7 +979,7 @@ TEST_P(SequencedWorkerPoolTest,
   // (PostRepostingBlockingTask). It can't run when tasks are redirected to
   // TaskScheduler because TaskScheduler doesn't provide a way to limit the
   // number of BLOCK_SHUTDOWN tasks posted during shutdown.
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
+  if (RedirectedToTaskScheduler())
     return;
 
   const std::string sequence_token_name("name");
@@ -956,11 +1000,6 @@ TEST_P(SequencedWorkerPoolTest,
 
 // Verify that FlushForTesting works as intended.
 TEST_P(SequencedWorkerPoolTest, FlushForTesting) {
-  // FlushForTesting() can't be called when tasks are redirected to the
-  // TaskScheduler.
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
-    return;
-
   // Should be fine to call on a new instance.
   pool()->FlushForTesting();
 
@@ -986,8 +1025,10 @@ TEST_P(SequencedWorkerPoolTest, FlushForTesting) {
   // tracker.
   EXPECT_FALSE(tracker()->HasOneRef());
   pool()->FlushForTesting();
-  EXPECT_TRUE(tracker()->HasOneRef());
   EXPECT_EQ(1 + kNumFastTasks + 1 + 3, tracker()->GetTasksCompletedCount());
+  // TaskScheduler deletes unexecuted delayed tasks as part of ~TaskScheduler()
+  // instead of TaskScheduler::FlushForTesting().
+  EXPECT_EQ(!RedirectedToTaskScheduler(), tracker()->HasOneRef());
 
   // Should be fine to call on an idle instance with all threads created, and
   // spamming the method shouldn't deadlock or confuse the class.
@@ -996,7 +1037,16 @@ TEST_P(SequencedWorkerPoolTest, FlushForTesting) {
 
   // Should be fine to call after shutdown too.
   pool()->Shutdown();
+  if (RedirectedToTaskScheduler())
+    TaskScheduler::GetInstance()->Shutdown();
   pool()->FlushForTesting();
+
+  // Verify that all tasks are deleted once the SequencedWorkerPool and the
+  // TaskScheduler are deleted.
+  DeletePool();
+  if (RedirectedToTaskScheduler())
+    DeleteTaskScheduler();
+  EXPECT_TRUE(tracker()->HasOneRef());
 }
 
 namespace {
@@ -1021,7 +1071,7 @@ TEST_P(SequencedWorkerPoolTest, GetWorkerPoolAndSequenceTokenForCurrentThread) {
   // SequencedWorkerPool when redirection to TaskScheduler is enabled. These
   // methods are only used from SequencedTaskRunnerHandle and
   // SequenceCheckerImpl which work fine in TaskScheduler.
-  if (GetParam() == SequencedWorkerPoolRedirection::TO_TASK_SCHEDULER)
+  if (RedirectedToTaskScheduler())
     return;
 
   EnsureAllWorkersCreated();

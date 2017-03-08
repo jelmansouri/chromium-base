@@ -456,7 +456,7 @@ void RunTest_RecursiveSupport2(MessageLoop::Type message_loop_type) {
 
 void PostNTasksThenQuit(int posts_remaining) {
   if (posts_remaining > 1) {
-    MessageLoop::current()->task_runner()->PostTask(
+    ThreadTaskRunnerHandle::Get()->PostTask(
         FROM_HERE, Bind(&PostNTasksThenQuit, posts_remaining - 1));
   } else {
     MessageLoop::current()->QuitWhenIdle();
@@ -614,9 +614,6 @@ RUN_MESSAGE_LOOP_TESTS(UI, &TypeUIMessagePumpFactory);
 RUN_MESSAGE_LOOP_TESTS(IO, &TypeIOMessagePumpFactory);
 
 #if defined(OS_WIN)
-// Additional set of tests for GPU version of UI message loop.
-RUN_MESSAGE_LOOP_TESTS(GPU, &MessagePumpForGpu::CreateMessagePumpForGpu);
-
 TEST(MessageLoopTest, PostDelayedTask_SharedTimer_SubPump) {
   RunTest_PostDelayedTask_SharedTimer_SubPump();
 }
@@ -742,7 +739,7 @@ TEST(MessageLoopTest, FileDescriptorWatcherOutlivesMessageLoop) {
   int fd = pipefds[1];
   {
     // Arrange for controller to live longer than message loop.
-    MessageLoopForIO::FileDescriptorWatcher controller;
+    MessageLoopForIO::FileDescriptorWatcher controller(FROM_HERE);
     {
       MessageLoopForIO message_loop;
 
@@ -769,7 +766,7 @@ TEST(MessageLoopTest, FileDescriptorWatcherDoubleStop) {
     // Arrange for message loop to live longer than controller.
     MessageLoopForIO message_loop;
     {
-      MessageLoopForIO::FileDescriptorWatcher controller;
+      MessageLoopForIO::FileDescriptorWatcher controller(FROM_HERE);
 
       QuitDelegate delegate;
       message_loop.WatchFileDescriptor(fd,
@@ -872,7 +869,7 @@ TEST(MessageLoopTest, ThreadMainTaskRunner) {
       &Foo::Test1ConstRef, foo, a));
 
   // Post quit task;
-  MessageLoop::current()->task_runner()->PostTask(
+  ThreadTaskRunnerHandle::Get()->PostTask(
       FROM_HERE,
       Bind(&MessageLoop::QuitWhenIdle, Unretained(MessageLoop::current())));
 

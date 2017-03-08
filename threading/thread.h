@@ -44,7 +44,15 @@ class RunLoop;
 //
 // This API is not thread-safe: unless indicated otherwise its methods are only
 // valid from the owning sequence (which is the one from which Start() is
-// invoked, should it differ from the one on which it was constructed).
+// invoked -- should it differ from the one on which it was constructed).
+//
+// Sometimes it's useful to kick things off on the initial sequence (e.g.
+// construction, Start(), task_runner()), but to then hand the Thread over to a
+// pool of users for the last one of them to destroy it when done. For that use
+// case, Thread::DetachFromSequence() allows the owning sequence to give up
+// ownership. The caller is then responsible to ensure a happens-after
+// relationship between the DetachFromSequence() call and the next use of that
+// Thread object (including ~Thread()).
 class BASE_EXPORT Thread : PlatformThread::Delegate {
  public:
   struct BASE_EXPORT Options {
@@ -151,6 +159,9 @@ class BASE_EXPORT Thread : PlatformThread::Delegate {
   // Stop may be called multiple times and is simply ignored if the thread is
   // already stopped or currently stopping.
   //
+  // Start/Stop are not thread-safe and callers that desire to invoke them from
+  // different threads must ensure mutual exclusion.
+  //
   // NOTE: If you are a consumer of Thread, it is not necessary to call this
   // before deleting your Thread objects, as the destructor will do it.
   // IF YOU ARE A SUBCLASS OF Thread, YOU MUST CALL THIS IN YOUR DESTRUCTOR.
@@ -164,10 +175,16 @@ class BASE_EXPORT Thread : PlatformThread::Delegate {
   // deadlock on Windows with printer worker thread. In any other case, Stop()
   // should be used.
   //
-  // StopSoon should not be called multiple times as it is risky to do so. It
-  // could cause a timing issue in message_loop() access. Call Stop() to reset
-  // the thread object once it is known that the thread has quit.
+  // Call Stop() to reset the thread object once it is known that the thread has
+  // quit.
   void StopSoon();
+
+  // Detaches the owning sequence, indicating that the next call to this API
+  // (including ~Thread()) can happen from a different sequence (to which it
+  // will be rebound). This call itself must happen on the current owning
+  // sequence and the caller must ensure the next API call has a happens-after
+  // relationship with this one.
+  void DetachFromSequence();
 
   // Returns the message loop for this thread.  Use the MessageLoop's
   // PostTask methods to execute code on the thread.  This only returns
@@ -244,6 +261,10 @@ class BASE_EXPORT Thread : PlatformThread::Delegate {
   // Bind this Thread to an existing MessageLoop instead of starting a new one.
   void SetMessageLoop(MessageLoop* message_loop);
 
+  bool using_external_message_loop() const {
+    return using_external_message_loop_;
+  }
+
  private:
 #if defined(OS_WIN)
   enum ComStatus {
@@ -293,7 +314,9 @@ class BASE_EXPORT Thread : PlatformThread::Delegate {
 
   // True only if |message_loop_| was externally provided by |SetMessageLoop()|
   // in which case this Thread has no underlying |thread_| and should merely
-  // drop |message_loop_| on Stop().
+  // drop |message_loop_| on Stop(). In that event, this remains true after
+  // Stop() was invoked so that subclasses can use this state to build their own
+  // cleanup logic as required.
   bool using_external_message_loop_ = false;
 
   // Stores Options::timer_slack_ until the message loop has been bound to

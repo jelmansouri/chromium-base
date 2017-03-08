@@ -5,12 +5,14 @@
 #include "base/threading/thread.h"
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include <vector>
 
 #include "base/bind.h"
 #include "base/debug/leak_annotations.h"
 #include "base/macros.h"
+#include "base/memory/ptr_util.h"
 #include "base/message_loop/message_loop.h"
 #include "base/run_loop.h"
 #include "base/single_thread_task_runner.h"
@@ -136,14 +138,16 @@ void ReturnThreadId(base::Thread* thread,
 TEST_F(ThreadTest, StartWithOptions_StackSize) {
   Thread a("StartWithStackSize");
   // Ensure that the thread can work with only 12 kb and still process a
-  // message.
+  // message. At the same time, we should scale with the bitness of the system
+  // where 12 kb is definitely not enough.
+  // 12 kb = 3072 Slots on a 32-bit system, so we'll scale based off of that.
   Thread::Options options;
 #if defined(ADDRESS_SANITIZER) || !defined(NDEBUG)
-  // ASan bloats the stack variables and overflows the 12 kb stack. Some debug
-  // builds also grow the stack too much.
-  options.stack_size = 24*1024;
+  // ASan bloats the stack variables and overflows the 3072 slot stack. Some
+  // debug builds also grow the stack too much.
+  options.stack_size = 2 * 3072 * sizeof(uintptr_t);
 #else
-  options.stack_size = 12*1024;
+  options.stack_size = 3072 * sizeof(uintptr_t);
 #endif
   EXPECT_TRUE(a.StartWithOptions(options));
   EXPECT_TRUE(a.message_loop());
@@ -228,19 +232,19 @@ TEST_F(ThreadTest, DestroyWhileRunningIsSafe) {
 
 // TODO(gab): Enable this test when destroying a non-joinable Thread instance
 // is supported (proposal @ https://crbug.com/629139#c14).
-// TEST_F(ThreadTest, DestroyWhileRunningNonJoinableIsSafe) {
-//   {
-//     Thread a("DestroyWhileRunningNonJoinableIsSafe");
-//     Thread::Options options;
-//     options.joinable = false;
-//     EXPECT_TRUE(a.StartWithOptions(options));
-//     EXPECT_TRUE(a.WaitUntilThreadStarted());
-//   }
-//
-//   // Attempt to catch use-after-frees from the non-joinable thread in the
-//   // scope of this test if any.
-//   base::PlatformThread::Sleep(base::TimeDelta::FromMilliseconds(20));
-// }
+TEST_F(ThreadTest, DISABLED_DestroyWhileRunningNonJoinableIsSafe) {
+  {
+    Thread a("DestroyWhileRunningNonJoinableIsSafe");
+    Thread::Options options;
+    options.joinable = false;
+    EXPECT_TRUE(a.StartWithOptions(options));
+    EXPECT_TRUE(a.WaitUntilThreadStarted());
+  }
+
+  // Attempt to catch use-after-frees from the non-joinable thread in the
+  // scope of this test if any.
+  base::PlatformThread::Sleep(base::TimeDelta::FromMilliseconds(20));
+}
 
 TEST_F(ThreadTest, StopSoon) {
   Thread a("StopSoon");
@@ -269,6 +273,49 @@ TEST_F(ThreadTest, StopTwiceNop) {
   // Calling them when not running should also nop.
   a.StopSoon();
   a.Stop();
+}
+
+// TODO(gab): Enable this test in conjunction with re-enabling the sequence
+// check in Thread::Stop() as part of http://crbug.com/629139.
+TEST_F(ThreadTest, DISABLED_StopOnNonOwningThreadIsDeath) {
+  Thread a("StopOnNonOwningThreadDeath");
+  EXPECT_TRUE(a.StartAndWaitForTesting());
+
+  Thread b("NonOwningThread");
+  b.Start();
+  EXPECT_DCHECK_DEATH({
+    // Stopping |a| on |b| isn't allowed.
+    b.task_runner()->PostTask(FROM_HERE,
+                              base::Bind(&Thread::Stop, base::Unretained(&a)));
+    // Block here so the DCHECK on |b| always happens in this scope.
+    base::PlatformThread::Sleep(base::TimeDelta::Max());
+  });
+}
+
+TEST_F(ThreadTest, TransferOwnershipAndStop) {
+  std::unique_ptr<Thread> a =
+      base::MakeUnique<Thread>("TransferOwnershipAndStop");
+  EXPECT_TRUE(a->StartAndWaitForTesting());
+  EXPECT_TRUE(a->IsRunning());
+
+  Thread b("TakingOwnershipThread");
+  b.Start();
+
+  base::WaitableEvent event(base::WaitableEvent::ResetPolicy::MANUAL,
+                            base::WaitableEvent::InitialState::NOT_SIGNALED);
+
+  // a->DetachFromSequence() should allow |b| to use |a|'s Thread API.
+  a->DetachFromSequence();
+  b.task_runner()->PostTask(
+      FROM_HERE, base::Bind(
+                     [](std::unique_ptr<Thread> thread_to_stop,
+                        base::WaitableEvent* event_to_signal) -> void {
+                       thread_to_stop->Stop();
+                       event_to_signal->Signal();
+                     },
+                     base::Passed(&a), base::Unretained(&event)));
+
+  event.Wait();
 }
 
 TEST_F(ThreadTest, StartTwice) {
@@ -483,6 +530,12 @@ class ExternalMessageLoopThread : public Thread {
 
   void InstallMessageLoop() { SetMessageLoop(&external_message_loop_); }
 
+  void VerifyUsingExternalMessageLoop(
+      bool expected_using_external_message_loop) {
+    EXPECT_EQ(expected_using_external_message_loop,
+              using_external_message_loop());
+  }
+
  private:
   base::MessageLoop external_message_loop_;
 
@@ -495,10 +548,12 @@ TEST_F(ThreadTest, ExternalMessageLoop) {
   ExternalMessageLoopThread a;
   EXPECT_FALSE(a.message_loop());
   EXPECT_FALSE(a.IsRunning());
+  a.VerifyUsingExternalMessageLoop(false);
 
   a.InstallMessageLoop();
   EXPECT_TRUE(a.message_loop());
   EXPECT_TRUE(a.IsRunning());
+  a.VerifyUsingExternalMessageLoop(true);
 
   bool ran = false;
   a.task_runner()->PostTask(
@@ -509,6 +564,7 @@ TEST_F(ThreadTest, ExternalMessageLoop) {
   a.Stop();
   EXPECT_FALSE(a.message_loop());
   EXPECT_FALSE(a.IsRunning());
+  a.VerifyUsingExternalMessageLoop(true);
 
   // Confirm that running any remaining tasks posted from Stop() goes smoothly
   // (e.g. https://codereview.chromium.org/2135413003/#ps300001 crashed if

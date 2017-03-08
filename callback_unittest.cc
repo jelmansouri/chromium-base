@@ -25,8 +25,8 @@ struct FakeBindState1 : internal::BindStateBase {
   FakeBindState1() : BindStateBase(&NopInvokeFunc, &Destroy, &IsCancelled) {}
  private:
   ~FakeBindState1() {}
-  static void Destroy(internal::BindStateBase* self) {
-    delete static_cast<FakeBindState1*>(self);
+  static void Destroy(const internal::BindStateBase* self) {
+    delete static_cast<const FakeBindState1*>(self);
   }
   static bool IsCancelled(const internal::BindStateBase*) {
     return false;
@@ -37,8 +37,8 @@ struct FakeBindState2 : internal::BindStateBase {
   FakeBindState2() : BindStateBase(&NopInvokeFunc, &Destroy, &IsCancelled) {}
  private:
   ~FakeBindState2() {}
-  static void Destroy(internal::BindStateBase* self) {
-    delete static_cast<FakeBindState2*>(self);
+  static void Destroy(const internal::BindStateBase* self) {
+    delete static_cast<const FakeBindState2*>(self);
   }
   static bool IsCancelled(const internal::BindStateBase*) {
     return false;
@@ -110,6 +110,17 @@ TEST_F(CallbackTest, Reset) {
   ASSERT_FALSE(callback_a_.Equals(null_callback_));
 
   callback_a_.Reset();
+
+  EXPECT_TRUE(callback_a_.is_null());
+  EXPECT_TRUE(callback_a_.Equals(null_callback_));
+}
+
+TEST_F(CallbackTest, Move) {
+  // Moving should reset the callback.
+  ASSERT_FALSE(callback_a_.is_null());
+  ASSERT_FALSE(callback_a_.Equals(null_callback_));
+
+  auto tmp = std::move(callback_a_);
 
   EXPECT_TRUE(callback_a_.is_null());
   EXPECT_TRUE(callback_a_.Equals(null_callback_));
