@@ -4,8 +4,10 @@
 
 #include "base/debug/stack_trace.h"
 #include "base/syslog_logging.h"
+#include "build/buildflag.h"
+#include "base/debug/debugging_flags.h"
 
-#if defined(OS_WIN)
+#if defined(OS_WIN) && BUILDFLAG(ENABLE_SYSLOG)
 #include "base/bind.h"
 #include "base/callback_helpers.h"
 #include "base/win/eventlog_messages.h"
@@ -21,7 +23,7 @@
 
 namespace logging {
 
-#if defined(OS_WIN)
+#if defined(OS_WIN) && BUILDFLAG(ENABLE_SYSLOG)
 
 namespace {
 std::string* g_event_source_name = nullptr;
@@ -40,7 +42,7 @@ EventLogMessage::EventLogMessage(const char* file,
 }
 
 EventLogMessage::~EventLogMessage() {
-#if defined(OS_WIN)
+#if defined(OS_WIN) && BUILDFLAG(ENABLE_SYSLOG)
   // If g_event_source_name is nullptr (which it is per default) SYSLOG will
   // degrade gracefully to regular LOG. If you see this happening most probably
   // you are using SYSLOG before you called SetEventSourceName.

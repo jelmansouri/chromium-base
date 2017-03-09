@@ -8,5 +8,6 @@
 #include "build/buildflag.h"
 
 #define BUILDFLAG_INTERNAL_ENABLE_PROFILING() 1
+#define BUILDFLAG_INTERNAL_ENABLE_SYSLOG() 0
 
 #endif // BASE_DEBUG_DEBUGGING_FLAGS_
